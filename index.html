@@ -250,6 +250,7 @@
     </div>
     <div class="header-actions">
       <span class="btn save-indicator">3x SAVE</span>
+      <button class="btn" onclick="openModal('sources')">👥 Sources</button>
       <button class="btn" onclick="openModal('deleted')">📦 Archive</button>
       <button class="btn" onclick="exportData()">💾 Export</button>
       <button class="btn" onclick="document.getElementById('importFile').click()">📥 Import</button>
@@ -338,7 +339,8 @@
       <div class="form-group"><label>Wallet</label><select id="mo-wallet" onchange="toggleBankSub('mo')" required><option value="momo">📱 Momo</option><option value="cash">💵 Cash</option><option value="bank">🏦 Bank</option><option value="cheque">📄 Cheque</option></select></div>
       <div class="bank-sub-select" id="mo-bank-sub"><label>Bank Account</label><select id="mo-bank-account"><option value="personal">🏠 Personal Account</option><option value="work">💼 Work / Company</option></select></div>
       <div class="form-group"><label>Amount</label><input type="number" id="mo-amount" step="0.01" min="0.01" placeholder="0.00" required /></div>
-      <div class="form-group"><label>To (Who)</label><input type="text" id="mo-source" placeholder="Name or Identity" maxlength="80" required /></div>
+      <div class="form-group"><label>To (Who)</label><input type="text" id="mo-source" placeholder="Name or Identity" maxlength="80" required oninput="showSourceBalanceForOut(this.value)" /></div>
+      <div id="mo-source-balance" style="font-size:10px;color:var(--dim);margin-top:-8px;margin-bottom:8px;min-height:14px;"></div>
       <div class="form-group"><label>Description</label><input type="text" id="mo-desc" placeholder="What did you spend it on?" maxlength="120" required /></div>
       <div class="modal-btns"><button type="button" class="btn-cancel" onclick="closeModal('moneyOut')">Cancel</button><button type="submit" class="btn-confirm">Confirm</button></div>
     </form>
@@ -389,6 +391,14 @@
       <select id="filterWallet" onchange="renderDetailedTransactions()"><option value="all">All Wallets</option><option value="momo">Momo</option><option value="cash">Cash</option><option value="bank">Bank</option><option value="cheque">Cheque</option></select>
     </div>
     <div class="report-tx-list" id="reportTxList"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-sources">
+  <div class="modal modal-wide">
+    <div class="modal-head"><div class="modal-title">👥 SOURCE BALANCES</div><button class="modal-close" onclick="closeModal('sources')">&times;</button></div>
+    <div style="margin-bottom:10px; font-size:10px; color:var(--dim);">Tracks how much each person gave vs received. You cannot give back more than they brought.</div>
+    <div class="breakdown-list" id="sourcesList"></div>
   </div>
 </div>
 
@@ -447,11 +457,13 @@ const defaultState = () => ({
   transactions: [],
   deletedTransactions: [],
   createdAt: Date.now(),
-  currency: '$'
+  currency: '$',
+  sourceBalances: {}
 });
 let state = defaultState();
 let currentPreset = 'today';
 let customFrom = null, customTo = null;
+let sourceReminders = {};
 
 // ==========================================
 // PASSWORD HASHING
@@ -647,6 +659,7 @@ function enterApp() {
     updateSessionTimer();
     setTimeout(() => {
       render();
+      initSourceReminders();
       if (window._restoreSource) { toast('Restored from ' + window._restoreSource); window._restoreSource = null; }
     }, 100);
   } catch (err) { console.error('Enter app error:', err); }
@@ -656,6 +669,8 @@ function logout() {
   try {
     currentUserEmail = null;
     clearTimeout(sessionTimer);
+    Object.values(sourceReminders).forEach(clearInterval);
+    sourceReminders = {};
     document.getElementById('authScreen').classList.remove('hidden');
     document.getElementById('mainApp').classList.remove('visible');
     document.getElementById('bottomNav').classList.remove('visible');
@@ -677,6 +692,7 @@ function validateState(parsed) {
     if (!Array.isArray(parsed.transactions)) parsed.transactions = [];
     if (!Array.isArray(parsed.deletedTransactions)) parsed.deletedTransactions = [];
     if (!parsed.currency) parsed.currency = '$';
+    if (!parsed.sourceBalances || typeof parsed.sourceBalances !== 'object') parsed.sourceBalances = {};
     return parsed;
   } catch (e) { return defaultState(); }
 }
@@ -778,12 +794,74 @@ function formatFullDate(iso) {
 }
 function escapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function toDateStr(d) { return d.toISOString().slice(0, 10); }
+
 function simulateDeletionReversal(tx) {
   const sim = { ...state.balances };
   if (tx.type === 'in') sim[tx.wallet] -= tx.amount;
   else if (tx.type === 'out') sim[tx.wallet] += tx.amount;
   else if (tx.type === 'transfer') { sim[tx.from] += tx.amount; sim[tx.to] -= tx.amount; }
   return { balances: sim, negatives: Object.entries(sim).filter(([k, v]) => v < 0) };
+}
+
+// ===== SOURCE BALANCE HELPERS =====
+function getSourceKey(name) { return name.trim().toLowerCase(); }
+function getSourceBalance(name) {
+  const key = getSourceKey(name);
+  return state.sourceBalances[key] || { name: name.trim(), in: 0, out: 0, net: 0 };
+}
+function updateSourceBalance(name, type, amount) {
+  const key = getSourceKey(name);
+  if (!state.sourceBalances[key]) state.sourceBalances[key] = { name: name.trim(), in: 0, out: 0, net: 0 };
+  if (type === 'in') state.sourceBalances[key].in += amount;
+  else if (type === 'out') state.sourceBalances[key].out += amount;
+  state.sourceBalances[key].net = state.sourceBalances[key].in - state.sourceBalances[key].out;
+  if (state.sourceBalances[key].net <= 0 && sourceReminders[key]) {
+    clearInterval(sourceReminders[key]);
+    delete sourceReminders[key];
+  }
+}
+function scheduleSourceReminder(source) {
+  const key = getSourceKey(source);
+  if (sourceReminders[key]) clearInterval(sourceReminders[key]);
+  sourceReminders[key] = setInterval(() => {
+    const bal = getSourceBalance(source);
+    if (bal.net <= 0) {
+      clearInterval(sourceReminders[key]);
+      delete sourceReminders[key];
+      return;
+    }
+    toast('⏰ Reminder: ' + bal.name + ' still has ' + fmt(bal.net) + ' remaining to receive', 'warn');
+  }, 2 * 60 * 1000);
+}
+function initSourceReminders() {
+  Object.entries(state.sourceBalances).forEach(([key, data]) => {
+    if (data.net > 0) scheduleSourceReminder(data.name || key);
+  });
+}
+function showSourceBalanceForOut(name) {
+  const el = document.getElementById('mo-source-balance');
+  if (!el) return;
+  const bal = getSourceBalance(name);
+  if (bal.net > 0) {
+    el.innerHTML = '💡 Can return up to <b style="color:var(--neon)">' + fmt(bal.net) + '</b> to ' + escapeHtml(name);
+  } else if (bal.in > 0) {
+    el.innerHTML = '✅ Settled with ' + escapeHtml(name) + ' (In: ' + fmt(bal.in) + ')';
+  } else {
+    el.innerHTML = '';
+  }
+}
+function renderSources() {
+  const list = document.getElementById('sourcesList');
+  const entries = Object.entries(state.sourceBalances).filter(([k, v]) => v.in > 0 || v.out > 0).sort((a, b) => b[1].net - a[1].net);
+  if (entries.length === 0) {
+    list.innerHTML = '<div class="empty-state"><span class="emoji">👤</span>No source balances yet</div>';
+    return;
+  }
+  list.innerHTML = entries.map(([key, data]) => {
+    const netColor = data.net > 0 ? 'var(--neon)' : data.net < 0 ? 'var(--danger)' : 'var(--dim)';
+    const status = data.net > 0 ? '⏰ owes ' + fmt(data.net) : data.net < 0 ? '💸 you owe ' + fmt(Math.abs(data.net)) : '✅ settled';
+    return '<div class="breakdown-item" style="margin-bottom:6px;"><div class="period" style="text-transform:capitalize;">' + escapeHtml(data.name || key) + '</div><div class="b-in">▲ ' + fmt(data.in) + '</div><div class="b-out">▼ ' + fmt(data.out) + '</div><div class="b-count"><b style="color:' + netColor + '">' + status + '</b></div></div>';
+  }).join('');
 }
 
 // ==========================================
@@ -814,6 +892,7 @@ function handleMoneyIn(e) {
     if (!desc) return toast('Description required', 'error');
     state.balances[wallet] += amount;
     if (wallet === 'bank' && bankAccount) state.bankSubBalances[bankAccount] += amount;
+    updateSourceBalance(source, 'in', amount);
     state.transactions.unshift({ id: uid(), type: 'in', wallet, amount, source, description: desc, bankAccount, date: now() });
     saveState(); render(); closeModal('moneyIn'); e.target.reset();
     document.getElementById('mi-bank-sub').classList.remove('active');
@@ -832,9 +911,19 @@ function handleMoneyOut(e) {
     if (!amount || amount <= 0) return toast('Invalid amount', 'error');
     if (!source) return toast('Recipient required', 'error');
     if (!desc) return toast('Description required', 'error');
+    const srcBal = getSourceBalance(source);
+    if (srcBal.net > 0 && amount > srcBal.net) {
+      return toast('Cannot give ' + fmt(amount) + ' to ' + source + '. They only gave ' + fmt(srcBal.net), 'error');
+    }
     if (amount > state.balances[wallet]) return toast('Insufficient ' + WALLET_NAMES[wallet] + ' (' + fmt(state.balances[wallet]) + ')', 'error');
     state.balances[wallet] -= amount;
     if (wallet === 'bank' && bankAccount) state.bankSubBalances[bankAccount] -= amount;
+    updateSourceBalance(source, 'out', amount);
+    const newSrcBal = getSourceBalance(source);
+    if (newSrcBal.net > 0) {
+      toast('💡 ' + newSrcBal.name + ' still has ' + fmt(newSrcBal.net) + ' remaining', 'warn');
+      scheduleSourceReminder(source);
+    }
     state.transactions.unshift({ id: uid(), type: 'out', wallet, amount, source, description: desc, bankAccount, date: now() });
     saveState(); render(); closeModal('moneyOut'); e.target.reset();
     document.getElementById('mo-bank-sub').classList.remove('active');
@@ -886,6 +975,18 @@ function deleteTransaction(id) {
       if (tx.from === 'bank' && tx.fromBankAccount) state.bankSubBalances[tx.fromBankAccount] += tx.amount;
       if (tx.to === 'bank' && tx.toBankAccount) state.bankSubBalances[tx.toBankAccount] -= tx.amount;
     }
+    if (tx.source) {
+      const key = getSourceKey(tx.source);
+      if (state.sourceBalances[key]) {
+        if (tx.type === 'in') state.sourceBalances[key].in -= tx.amount;
+        else if (tx.type === 'out') state.sourceBalances[key].out -= tx.amount;
+        state.sourceBalances[key].net = state.sourceBalances[key].in - state.sourceBalances[key].out;
+        if (state.sourceBalances[key].net <= 0 && sourceReminders[key]) {
+          clearInterval(sourceReminders[key]);
+          delete sourceReminders[key];
+        }
+      }
+    }
     state.deletedTransactions.unshift({ ...tx, deletedAt: now() });
     state.transactions.splice(idx, 1);
     saveState(); render();
@@ -914,6 +1015,14 @@ function restoreTransaction(id) {
       state.balances[tx.from] -= tx.amount; state.balances[tx.to] += tx.amount;
       if (tx.from === 'bank' && tx.fromBankAccount) state.bankSubBalances[tx.fromBankAccount] -= tx.amount;
       if (tx.to === 'bank' && tx.toBankAccount) state.bankSubBalances[tx.toBankAccount] += tx.amount;
+    }
+    if (tx.source) {
+      const key = getSourceKey(tx.source);
+      if (!state.sourceBalances[key]) state.sourceBalances[key] = { name: tx.source, in: 0, out: 0, net: 0 };
+      if (tx.type === 'in') state.sourceBalances[key].in += tx.amount;
+      else if (tx.type === 'out') state.sourceBalances[key].out += tx.amount;
+      state.sourceBalances[key].net = state.sourceBalances[key].in - state.sourceBalances[key].out;
+      if (state.sourceBalances[key].net > 0) scheduleSourceReminder(tx.source);
     }
     const restored = { ...tx }; delete restored.deletedAt;
     state.transactions.unshift(restored);
@@ -1232,6 +1341,7 @@ function openModal(name) {
   if (m) m.classList.add('active');
   if (name === 'reports') renderReport();
   if (name === 'deleted') renderDeletedTransactions();
+  if (name === 'sources') renderSources();
   if (name === 'moneyIn') { const s = document.getElementById('mi-bank-sub'); if (s) s.classList.remove('active'); }
   if (name === 'moneyOut') { const s = document.getElementById('mo-bank-sub'); if (s) s.classList.remove('active'); }
   if (name === 'transfer') {
